@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using Kanvas.Swizzle;
 using Komponent.IO;
 using Konnect.Contract.DataClasses.Plugin.File.Image;
@@ -15,65 +15,112 @@ namespace plugin_nintendo.Images
 
         private CtpkHeader _header;
 
-        public List<ImageFileInfo> Load(Stream input)
+        public List<ImageFileInfo> Load(Stream input) // the main load
         {
-            using var br = new BinaryReaderX(input, Encoding.GetEncoding("Shift-JIS"));
+             using var br = new BinaryReaderX(input, Encoding.GetEncoding("Shift-JIS")); // only ASCII is really needed tbh
 
-            // Read header
-            _header = ReadHeader(br);
-
-            // Read tex entries
-            br.BaseStream.Position = 0x20;
-            var texEntries = ReadTexEntries(br, _header.texCount);
-
-            // Read data sizes
-            var dataSizes = new int[_header.texCount][];
-            for (var i = 0; i < _header.texCount; i++)
-                dataSizes[i] = ReadIntegers(br, texEntries[i].mipLvl);
-
-            // Read names
-            var names = new string[_header.texCount];
-            for (var i = 0; i < _header.texCount; i++)
-                names[i] = br.ReadNullTerminatedString();
-
-            // Read hash entries
-            br.BaseStream.Position = _header.crc32SecOffset;
-            var hashEntries = ReadHashEntries(br, _header.texCount).OrderBy(x => x.id).ToArray();
-
-            // Read mip map infos
-            br.BaseStream.Position = _header.texInfoOffset;
-            var mipMapEntries = ReadMipEntries(br, _header.texCount);
-
-            // Add images
-            var result = new List<ImageFileInfo>(_header.texCount);
-            for (var i = 0; i < _header.texCount; i++)
+            string magic = br.ReadString(4); // grab potential signature
+            br.BaseStream.Position = 0; // rewind
+            if (magic == "CTPK")
             {
-                // Read image data
-                br.BaseStream.Position = _header.texSecOffset + texEntries[i].texOffset;
-                var imageData = br.ReadBytes(dataSizes[i][0]);
-
-                // Read mip maps
-                var mipMaps = Enumerable.Range(1, texEntries[i].mipLvl - 1)
-                    .Select(x => br.ReadBytes(dataSizes[i][x]))
-                    .ToArray();
-
-                result.Add(new CtpkImageFileInfo
-                {
-                    Name = names[i],
-                    BitDepth = CtpkSupport.GetEncodingDefinitions().GetColorEncoding(texEntries[i].imageFormat).BitDepth,
-                    ImageData = imageData,
-                    ImageFormat = texEntries[i].imageFormat,
-                    ImageSize = new Size(texEntries[i].width, texEntries[i].height),
-                    MipMapData = mipMaps,
-                    Entry = texEntries[i],
-                    MipEntry = mipMapEntries[i],
-                    RemapPixels = context => new CtrSwizzle(context),
-                    PadSize = builder => builder.ToPowerOfTwo()
-                });
+                return LoadNormalCtpk(br);
             }
 
-            return result;
+            // read as icon CTPK if no signature exists (Has no header just flat, square RGB565)
+            long size = br.BaseStream.Length;
+             if (size % 2 == 0) // must be even for RGB565
+             {
+                int pixelCount = (int)(size / 2);
+                int side = (int)Math.Sqrt(pixelCount);
+
+                if (side * side == pixelCount && side % 8 == 0)
+                {
+                    byte[] rawData = br.ReadBytes((int)size);
+
+                    // create the CtokImageFileInfo lmao
+                    var info = new CtpkImageFileInfo
+                    {
+                        Name = "icon_ctpk",
+                        BitDepth = CtpkSupport.GetEncodingDefinitions().GetColorEncoding(3).BitDepth,
+                        ImageData = rawData,
+                        ImageFormat = 3, // RGB565
+                        ImageSize = new Size(side, side),
+                        MipMapData = Array.Empty<byte[]>(),
+                        Entry = new TexEntry
+                        {
+                            width = (short)side,
+                            height = (short)side,
+                            imageFormat = 3,
+                            mipLvl = 1,
+                            texDataSize = rawData.Length,
+                            texOffset = 0,
+                            type = 0
+                         },
+                        MipEntry = new MipmapEntry
+                        {
+                            mipmapFormat = 3,
+                            mipLvl = 1
+                        }
+                    };
+
+            return new List<ImageFileInfo> { info };
         }
+    }
+
+    // If that dosent work - try the normal CTPK loader again (definetly wont work but who cares)
+    return LoadNormalCtpk(br);
+}
+
+
+private List<ImageFileInfo> LoadNormalCtpk(BinaryReaderX br)
+{
+    _header = ReadHeader(br);
+
+    br.BaseStream.Position = 0x20; // Texture entries
+    var texEntries = ReadTexEntries(br, _header.texCount);
+
+    var dataSizes = new int[_header.texCount][]; // data sizes
+    for (var i = 0; i < _header.texCount; i++)
+        dataSizes[i] = ReadIntegers(br, texEntries[i].mipLvl);
+
+    var names = new string[_header.texCount]; // names
+    for (var i = 0; i < _header.texCount; i++)
+        names[i] = br.ReadNullTerminatedString();
+
+    br.BaseStream.Position = _header.crc32SecOffset; // hash entries
+    var hashEntries = ReadHashEntries(br, _header.texCount).OrderBy(x => x.id).ToArray();
+
+    br.BaseStream.Position = _header.texInfoOffset; // mipmap entries
+    var mipMapEntries = ReadMipEntries(br, _header.texCount);
+
+    // create ImageFileInfo
+    var result = new List<ImageFileInfo>(_header.texCount);
+    for (var i = 0; i < _header.texCount; i++)
+    {
+        br.BaseStream.Position = _header.texSecOffset + texEntries[i].texOffset;
+        var imageData = br.ReadBytes(dataSizes[i][0]);
+        var mipMaps = Enumerable.Range(1, texEntries[i].mipLvl - 1)
+                                .Select(x => br.ReadBytes(dataSizes[i][x]))
+                                .ToArray();
+
+        result.Add(new CtpkImageFileInfo
+        {
+            Name = names[i],
+            BitDepth = CtpkSupport.GetEncodingDefinitions().GetColorEncoding(texEntries[i].imageFormat).BitDepth,
+            ImageData = imageData,
+            ImageFormat = texEntries[i].imageFormat,
+            ImageSize = new Size(texEntries[i].width, texEntries[i].height),
+            MipMapData = mipMaps,
+            Entry = texEntries[i],
+            MipEntry = mipMapEntries[i],
+            RemapPixels = context => new CtrSwizzle(context),
+            PadSize = builder => builder.ToPowerOfTwo()
+        });
+    }
+
+    return result;
+}
+
 
         public void Save(Stream output, List<ImageFileInfo> images)
         {
